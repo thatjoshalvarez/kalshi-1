@@ -1,0 +1,82 @@
+from flask import Flask, render_template, request, jsonify
+import requests
+import pandas as pd
+from sklearn.linear_model import LinearRegression
+from datetime import datetime
+
+app = Flask(__name__)
+
+# Kalshi API base URL (public, no auth needed)
+KALSHI_API = 'https://api.elections.kalshi.com/trade-api/v2'
+
+def fetch_kalshi_data(status='open', with_markets=True):
+    try:
+        url = f"{KALSHI_API}/events?status={status}&with_nested_markets={str(with_markets).lower()}"
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        events = data.get('events', [])
+        processed = []
+        for event in events:
+            for market in event.get('markets', []):
+                yes_prob = (market.get('yes_bid', 0) + market.get('yes_ask', 0)) / 2 / 100 if market.get('yes_bid') and market.get('yes_ask') else market.get('last_price', 0) / 100
+                processed.append({
+                    'event_title': event.get('title', 'N/A'),
+                    'market_title': market.get('title', 'N/A'),
+                    'subtitle': market.get('subtitle', 'N/A'),
+                    'probability': round(yes_prob * 100, 2),
+                    'close_time': market.get('close_time', 'N/A'),
+                    'volume': market.get('volume', 0),
+                    'ticker': market.get('ticker', 'N/A')
+                })
+        return processed
+    except Exception as e:
+        print(f"Error fetching data: {e}")
+        return []
+
+def fetch_historical_for_ml(ticker):
+    try:
+        url = f"{KALSHI_API}/markets?ticker={ticker}&status=closed&limit=100"
+        response = requests.get(url)
+        response.raise_for_status()
+        markets = response.json().get('markets', [])
+        df = pd.DataFrame([{
+            'date': datetime.fromisoformat(m['close_time'].replace('Z', '+00:00')),
+            'last_price': m['last_price'],
+            'volume': m['volume']
+        } for m in markets if m.get('last_price') is not None])
+        return df.sort_values('date') if not df.empty else pd.DataFrame()
+    except Exception as e:
+        print(f"Error fetching historical data: {e}")
+        return pd.DataFrame()
+
+@app.route('/')
+def index():
+    data = fetch_kalshi_data()
+    return render_template('index.html', predictions=data)
+
+@app.route('/ml_predict', methods=['POST'])
+def ml_predict():
+    ticker = request.json.get('ticker', '')
+    df = fetch_historical_for_ml(ticker)
+    if df.empty:
+        return jsonify({'error': 'No historical data available for this ticker'})
+    
+    try:
+        df['days'] = (df['date'] - df['date'].min()).dt.days
+        X = df[['days', 'volume']].fillna(0)
+        y = df['last_price'].fillna(0)
+        model = LinearRegression()
+        model.fit(X, y)
+        future_days = pd.DataFrame({
+            'days': [df['days'].max() + i for i in range(1, 8)] if not df['days'].empty else range(1, 8),
+            'volume': [df['volume'].mean()] * 7 if not df['volume'].empty else [0] * 7
+        })
+        predictions = model.predict(future_days)
+        future_probs = [round(min(max(p / 100 * 100, 0), 100), 2) for p in predictions]
+        return jsonify({'predictions': future_probs})
+    except Exception as e:
+        return jsonify({'error': f'ML prediction failed: {str(e)}'})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080)
